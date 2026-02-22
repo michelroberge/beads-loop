@@ -90,7 +90,8 @@ func main() {
 			if age < staleTimeout {
 				fmt.Printf("[%s] resuming bead %s (last active %s ago)\n",
 					ts(), state.InProgressID, age.Round(time.Second))
-				if retryAt := implement(state.InProgressID); retryAt != nil {
+				retryAt, _ := implement(state.InProgressID)
+				if retryAt != nil {
 					waitRateLimit(retryAt)
 					continue
 				}
@@ -132,13 +133,21 @@ func main() {
 		fmt.Printf("\n%s\n[%s] implementing %s\n%s\n\n",
 			strings.Repeat("─", 60), ts(), beadID, strings.Repeat("─", 60))
 
-		if retryAt := implement(beadID); retryAt != nil {
+		retryAt, produced := implement(beadID)
+		if retryAt != nil {
 			waitRateLimit(retryAt)
 			// Keep state — will resume this bead after the limit expires.
 			continue
 		}
 
 		clearState()
+
+		if !produced {
+			// claude exited immediately without output (e.g. bad flag, config
+			// error). Back off to avoid a hot retry loop.
+			fmt.Printf("[%s] claude produced no output — backing off 15s\n", ts())
+			time.Sleep(15 * time.Second)
+		}
 	}
 }
 
@@ -222,8 +231,9 @@ func claimBead(id string) error {
 }
 
 // implement runs claude to implement the given bead, streaming output to stdout.
-// Returns a retry time if a rate limit was hit, nil on success.
-func implement(beadID string) *time.Time {
+// Returns (retryAt, produced): retryAt is non-nil when rate-limited;
+// produced is true when claude emitted at least one character of output.
+func implement(beadID string) (*time.Time, bool) {
 	cmd := exec.Command("claude",
 		"--print",
 		"--verbose",
@@ -237,12 +247,12 @@ func implement(beadID string) *time.Time {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Printf("[%s] pipe error: %v\n", ts(), err)
-		return nil
+		return nil, false
 	}
 
 	if err := cmd.Start(); err != nil {
 		fmt.Printf("[%s] start error: %v\n", ts(), err)
-		return nil
+		return nil, false
 	}
 
 	// Keep the state timestamp fresh while claude is running.
@@ -280,7 +290,7 @@ func implement(beadID string) *time.Time {
 	if !sr.atLineStart {
 		fmt.Println()
 	}
-	return retryAt
+	return retryAt, sr.hadOutput
 }
 
 // streamer holds formatting state across stream-json events.
@@ -365,8 +375,15 @@ func (sr *streamer) event(line string) (*time.Time, string) {
 
 	case "message_start":
 		// A new assistant turn is beginning (after tool results).
+		// Always separate turns with a blank line for readability.
 		if sr.hadOutput {
-			out := sr.nl()
+			var out string
+			if sr.atLineStart {
+				out = "\n" // already on fresh line, just add blank line
+			} else {
+				out = "\n\n" // end current line + blank line
+			}
+			sr.atLineStart = true
 			return nil, out
 		}
 		return nil, ""
