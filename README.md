@@ -122,4 +122,4 @@ The file is removed automatically when the bead completes. It is safe to delete 
 
 ## License
 
-MIT
+GPL 3.0
