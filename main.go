@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -14,13 +17,19 @@ import (
 )
 
 const (
-	stateFile    = ".beads-loop-state.json"
 	staleTimeout = 5 * time.Minute
 	retryDelay   = 30 * time.Second
 )
 
-// State tracks the currently claimed bead across restarts.
+var myUUID string
+
+func stateFilePath() string {
+	return fmt.Sprintf(".beads-loop-state-%s.json", myUUID)
+}
+
+// State tracks the currently claimed bead for this worker instance.
 type State struct {
+	OwnerUUID    string    `json:"owner_uuid"`
 	InProgressID string    `json:"in_progress_id,omitempty"`
 	StartedAt    time.Time `json:"started_at,omitempty"`
 	LastUpdated  time.Time `json:"last_updated,omitempty"`
@@ -68,23 +77,38 @@ var (
 	}
 )
 
-func main() {
-	fmt.Println("beads-loop v1.0 — autonomous bead implementer")
-	fmt.Printf("[%s] starting loop\n\n", ts())
+func generateUUID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
-	// Handle Ctrl+C: exit cleanly but keep state so work can resume.
+func main() {
+	myUUID = generateUUID()
+	fmt.Printf("beads-loop v2.0 — autonomous bead implementer\n")
+	fmt.Printf("[%s] worker %s starting\n\n", ts(), myUUID)
+
+	// Release beads from dead workers on startup.
+	cleanStalePeerFiles()
+
+	// Handle Ctrl+C / SIGTERM: release in-progress bead and exit cleanly.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Printf("\n[%s] interrupted — state preserved for resume\n", ts())
+		state := loadState()
+		if state.InProgressID != "" {
+			fmt.Printf("\n[%s] interrupted — releasing %s\n", ts(), state.InProgressID)
+			run("bd", "update", state.InProgressID, "--status=open")
+		}
+		os.Remove(stateFilePath())
 		os.Exit(0)
 	}()
 
 	for {
 		state := loadState()
 
-		// Resume a recently active in-progress bead.
+		// Resume a recently active in-progress bead owned by this worker.
 		if state.InProgressID != "" {
 			age := time.Since(state.LastUpdated)
 			if age < staleTimeout {
@@ -152,10 +176,12 @@ func main() {
 }
 
 // findWork returns the next bead to work on.
-// Priority: in_progress (resume) > ready (start new).
+// Priority: unclaimed in_progress (resume orphan) > ready (start new).
 // Returns allDone=true when nothing is open, in_progress, or blocked.
 func findWork() (beadID string, waitUntil *time.Time, allDone bool) {
-	// Check the full list first so we can resume an in_progress bead.
+	peerClaimed := getPeerClaimedBeads()
+
+	// Check the full list first so we can resume an orphaned in_progress bead.
 	listOut, listErr := run("bd", "list")
 	if listErr == nil {
 		beads := parseBeads(listOut)
@@ -165,7 +191,8 @@ func findWork() (beadID string, waitUntil *time.Time, allDone bool) {
 			case statusOpen, statusInProgress, statusBlocked:
 				hasActive = true
 			}
-			if b.Status == statusInProgress {
+			// Resume orphaned in_progress bead only if no live peer owns it.
+			if b.Status == statusInProgress && !peerClaimed[b.ID] {
 				return b.ID, nil, false
 			}
 		}
@@ -175,12 +202,12 @@ func findWork() (beadID string, waitUntil *time.Time, allDone bool) {
 		}
 	}
 
-	// Look for beads that are ready to start.
+	// Look for beads that are ready to start, skipping peer-claimed ones.
 	readyOut, readyErr := run("bd", "ready")
 	if readyErr == nil {
 		for _, line := range strings.Split(readyOut, "\n") {
 			m := beadLineRe.FindStringSubmatch(strings.TrimSpace(line))
-			if m != nil {
+			if m != nil && !peerClaimed[m[1]] {
 				return m[1], nil, false
 			}
 		}
@@ -192,6 +219,56 @@ func findWork() (beadID string, waitUntil *time.Time, allDone bool) {
 	}
 
 	return "", nil, false
+}
+
+// getPeerClaimedBeads returns the set of bead IDs currently owned by live peer workers.
+func getPeerClaimedBeads() map[string]bool {
+	claimed := make(map[string]bool)
+	files, _ := filepath.Glob(".beads-loop-state-*.json")
+	for _, f := range files {
+		if strings.Contains(f, myUUID) {
+			continue
+		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue // file may be mid-write; skip gracefully
+		}
+		var s State
+		if json.Unmarshal(data, &s) != nil {
+			continue
+		}
+		if s.InProgressID != "" && time.Since(s.LastUpdated) < staleTimeout {
+			claimed[s.InProgressID] = true
+		}
+	}
+	return claimed
+}
+
+// cleanStalePeerFiles removes state files from dead workers and releases their beads back to open.
+func cleanStalePeerFiles() {
+	files, _ := filepath.Glob(".beads-loop-state-*.json")
+	for _, f := range files {
+		if strings.Contains(f, myUUID) {
+			continue
+		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		var s State
+		if json.Unmarshal(data, &s) != nil {
+			os.Remove(f) // unparseable = treat as dead
+			continue
+		}
+		if time.Since(s.LastUpdated) >= staleTimeout {
+			if s.InProgressID != "" {
+				fmt.Printf("[%s] releasing stale bead %s (worker %s gone)\n",
+					ts(), s.InProgressID, s.OwnerUUID)
+				run("bd", "update", s.InProgressID, "--status=open")
+			}
+			os.Remove(f)
+		}
+	}
 }
 
 // parseBeads parses `bd list` output into a slice of beads.
@@ -236,7 +313,6 @@ func claimBead(id string) error {
 func implement(beadID string) (*time.Time, bool) {
 	cmd := exec.Command("claude",
 		"--print",
-		"--verbose",
 		"--dangerously-skip-permissions",
 		"--output-format", "stream-json",
 		"--include-partial-messages",
@@ -472,7 +548,7 @@ func waitRateLimit(t *time.Time) {
 // ── state helpers ────────────────────────────────────────────────────────────
 
 func loadState() State {
-	data, err := os.ReadFile(stateFile)
+	data, err := os.ReadFile(stateFilePath())
 	if err != nil {
 		return State{}
 	}
@@ -483,12 +559,12 @@ func loadState() State {
 
 func saveState(id string) {
 	s := State{
+		OwnerUUID:    myUUID,
 		InProgressID: id,
 		StartedAt:    time.Now(),
 		LastUpdated:  time.Now(),
 	}
-	data, _ := json.MarshalIndent(s, "", "  ")
-	os.WriteFile(stateFile, data, 0644)
+	writeStateAtomic(stateFilePath(), s)
 }
 
 // touchState updates LastUpdated without changing anything else.
@@ -498,12 +574,26 @@ func touchState(id string) {
 		return
 	}
 	s.LastUpdated = time.Now()
-	data, _ := json.MarshalIndent(s, "", "  ")
-	os.WriteFile(stateFile, data, 0644)
+	writeStateAtomic(stateFilePath(), s)
 }
 
 func clearState() {
-	os.Remove(stateFile)
+	os.Remove(stateFilePath())
+	cleanStalePeerFiles()
+}
+
+// writeStateAtomic writes state to a temp file then renames it into place.
+// rename(2) is atomic on POSIX local filesystems so readers always see a complete file.
+func writeStateAtomic(path string, s State) {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	os.Rename(tmp, path)
 }
 
 // ── utilities ────────────────────────────────────────────────────────────────
